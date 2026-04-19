@@ -1,0 +1,163 @@
+name: Build AutoFilmCropper
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macos
+            arch: arm64
+            python_arch: arm64
+            icon_file: icons/app.icns
+            artifact_name: AutoFilmCropper-macOS-arm64.zip
+
+          - os: macos-14
+            platform: macos
+            arch: x64
+            python_arch: x64
+            icon_file: icons/app.icns
+            artifact_name: AutoFilmCropper-macOS-x64.zip
+
+          - os: windows-latest
+            platform: windows
+            arch: x64
+            python_arch: x64
+            icon_file: icons/app.ico
+            artifact_name: AutoFilmCropper-Windows-x64.zip
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.python_arch }}
+
+      - name: Install dependencies
+        run: |
+          PREFIX=""
+          if [[ "${{ matrix.platform }}" == "macos" && "${{ matrix.arch }}" == "x64" ]]; then
+            PREFIX="arch -x86_64"
+          fi
+
+          echo "Build architecture context:"
+          $PREFIX uname -m
+
+          $PREFIX python -m pip install --upgrade pip setuptools wheel
+          $PREFIX python -m pip install -r requirements.txt pillow pyinstaller pyinstaller-hooks-contrib
+
+      - name: Prepare app icon (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          mkdir -p icons/icon.iconset
+
+          sips -z 16 16 "assets/app-icon.png" --out icons/icon.iconset/icon_16x16.png
+          sips -z 32 32 "assets/app-icon.png" --out icons/icon.iconset/icon_16x16@2x.png
+          sips -z 32 32 "assets/app-icon.png" --out icons/icon.iconset/icon_32x32.png
+          sips -z 64 64 "assets/app-icon.png" --out icons/icon.iconset/icon_32x32@2x.png
+          sips -z 128 128 "assets/app-icon.png" --out icons/icon.iconset/icon_128x128.png
+          sips -z 256 256 "assets/app-icon.png" --out icons/icon.iconset/icon_128x128@2x.png
+          sips -z 256 256 "assets/app-icon.png" --out icons/icon.iconset/icon_256x256.png
+          sips -z 512 512 "assets/app-icon.png" --out icons/icon.iconset/icon_256x256@2x.png
+          sips -z 512 512 "assets/app-icon.png" --out icons/icon.iconset/icon_512x512.png
+          sips -z 1024 1024 "assets/app-icon.png" --out icons/icon.iconset/icon_512x512@2x.png
+
+          iconutil -c icns -o icons/app.icns icons/icon.iconset
+
+      - name: Prepare app icon (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          mkdir -p icons
+          python -c "from PIL import Image; img = Image.open('assets/app-icon.png'); img.save('icons/app.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+
+      - name: Build with PyInstaller
+        run: |
+          ICON_ARG=""
+          if [ -f "${{ matrix.icon_file }}" ]; then
+            ICON_ARG="--icon=${{ matrix.icon_file }}"
+          fi
+
+          PREFIX=""
+          if [[ "${{ matrix.platform }}" == "macos" && "${{ matrix.arch }}" == "x64" ]]; then
+            PREFIX="arch -x86_64"
+          fi
+
+          PYI_ARCH_ARG=""
+          if [ "${{ matrix.platform }}" = "macos" ]; then
+            if [ "${{ matrix.arch }}" = "x64" ]; then
+              PYI_ARCH_ARG="--target-arch x86_64"
+            elif [ "${{ matrix.arch }}" = "arm64" ]; then
+              PYI_ARCH_ARG="--target-arch arm64"
+            fi
+          fi
+
+          $PREFIX python -m PyInstaller --clean --noconfirm --windowed --noconsole --onedir \
+            --name "AutoFilmCropper" \
+            $ICON_ARG \
+            $PYI_ARCH_ARG \
+            --collect-all tifffile \
+            main.py
+
+      - name: Package macOS app
+        if: matrix.platform == 'macos'
+        run: |
+          cd dist
+          chmod +x AutoFilmCropper.app/Contents/MacOS/AutoFilmCropper
+          ditto -c -k --sequesterRsrc --keepParent AutoFilmCropper.app ${{ matrix.artifact_name }}
+
+      - name: Package Windows app
+        if: matrix.platform == 'windows'
+        run: |
+          cd dist
+          powershell Compress-Archive -Path AutoFilmCropper -DestinationPath ${{ matrix.artifact_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Gather release files
+        run: |
+          mkdir -p release-files
+          find release-assets -type f -name '*.zip' -exec cp {} release-files/ \;
+          ls -lh release-files
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: release-files/*.zip
+          generate_release_notes: true
