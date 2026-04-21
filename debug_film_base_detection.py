@@ -8,7 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from image_core import FilmBaseColorModel, ImageCore
+from image_core import FilmBaseColorModel, FilmType, ImageCore
 
 
 def parse_aspect(text: str) -> float:
@@ -89,6 +89,12 @@ def main() -> int:
         help="Directory for debug PNG output. Defaults to FilmBase_Debug next to the input.",
     )
     parser.add_argument(
+        "--film-type",
+        choices=[film_type.value for film_type in FilmType],
+        default=FilmType.NEGATIVE.value,
+        help="Relationship between film base and image area brightness.",
+    )
+    parser.add_argument(
         "--min-area-ratio",
         type=float,
         default=0.05,
@@ -103,6 +109,7 @@ def main() -> int:
     aspect_ratio = parse_aspect(args.aspect)
     sample_rect = parse_sample_rect(args.sample_rect)
     base_rgb = parse_base_rgb(args.base_rgb)
+    film_type = FilmType(args.film_type)
     image_core = ImageCore(proxy_max_long_edge=2000)
     files = iter_tiff_files(input_path)
     if not files:
@@ -130,6 +137,7 @@ def main() -> int:
             target_aspect=aspect_ratio,
             sample_rect=sample_rect,
             base_color_model=base_color_model,
+            film_type=film_type,
             min_area_ratio=args.min_area_ratio,
         )
         sheet = make_contact_sheet(debug_bundle)

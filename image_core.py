@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -71,6 +72,13 @@ class FilmBaseColorModel:
     rgb_mean: tuple[float, float, float]
     lab_mean: tuple[float, float, float]
     lab_std: tuple[float, float, float]
+
+
+class FilmType(str, Enum):
+    """Brightness relationship between film base and image area."""
+
+    NEGATIVE = "negative"
+    REVERSAL = "reversal"
 
 
 @dataclass
@@ -371,6 +379,7 @@ class ImageCore:
         target_aspect: float,
         sample_rect: Optional[tuple[int, int, int, int]] = None,
         base_color_model: Optional[FilmBaseColorModel] = None,
+        film_type: FilmType = FilmType.NEGATIVE,
         previous_state: Optional[CropState] = None,
         min_area_ratio: float = 0.05,
     ) -> FilmBaseDebugBundle:
@@ -383,7 +392,11 @@ class ImageCore:
         img_h, img_w = gray.shape[:2]
 
         if sample_rect is None and base_color_model is None:
-            sample_rect = self._suggest_film_base_sample_rect(gray, min_area_ratio=min_area_ratio)
+            sample_rect = self._suggest_film_base_sample_rect(
+                gray,
+                min_area_ratio=min_area_ratio,
+                film_type=film_type,
+            )
         sample_preview = rgb.copy()
         lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
         sanitized_rect: Optional[tuple[int, int, int, int]] = None
@@ -399,16 +412,19 @@ class ImageCore:
         base_lab_std = np.asarray(base_color_model.lab_std, dtype=np.float32)
         base_rgb_mean = tuple(float(v) for v in base_color_model.rgb_mean)
 
-        light_drop = np.clip(base_lab_mean[0] - lab[..., 0], 0.0, None)
+        if film_type == FilmType.REVERSAL:
+            light_separation = np.clip(lab[..., 0] - base_lab_mean[0], 0.0, None)
+        else:
+            light_separation = np.clip(base_lab_mean[0] - lab[..., 0], 0.0, None)
         color_distance = np.linalg.norm(lab[..., 1:3] - base_lab_mean[1:3], axis=2)
-        combined_score = light_drop * 1.3 + color_distance * 0.9
+        combined_score = light_separation * 1.3 + color_distance * 0.9
 
         light_thresh = max(6.0, float(base_lab_std[0]) * 2.2)
         color_thresh = max(8.0, float(np.mean(base_lab_std[1:])) * 2.6)
         combined_thresh = light_thresh * 1.2 + color_thresh * 0.8
 
         non_base_mask = np.where(
-            ((light_drop >= light_thresh) & (combined_score >= combined_thresh))
+            ((light_separation >= light_thresh) & (combined_score >= combined_thresh))
             | (color_distance >= color_thresh * 1.35),
             255,
             0,
@@ -429,7 +445,7 @@ class ImageCore:
 
         chosen_state, projection = self._detect_crop_by_projection(
             non_base_mask=non_base_mask,
-            darkness_score=self._normalize_projection_score(light_drop, scale=max(light_thresh * 2.5, 1.0)),
+            support_score=self._normalize_projection_score(light_separation, scale=max(light_thresh * 2.5, 1.0)),
             target_aspect=target_aspect,
             image_width=img_w,
             image_height=img_h,
@@ -456,6 +472,7 @@ class ImageCore:
         target_aspect: float,
         sample_rect: Optional[tuple[int, int, int, int]] = None,
         base_color_model: Optional[FilmBaseColorModel] = None,
+        film_type: FilmType = FilmType.NEGATIVE,
         previous_state: Optional[CropState] = None,
         min_area_ratio: float = 0.05,
     ) -> Optional[CropState]:
@@ -465,6 +482,7 @@ class ImageCore:
             target_aspect=target_aspect,
             sample_rect=sample_rect,
             base_color_model=base_color_model,
+            film_type=film_type,
             previous_state=previous_state,
             min_area_ratio=min_area_ratio,
         )
@@ -599,7 +617,7 @@ class ImageCore:
     def _detect_crop_by_projection(
         self,
         non_base_mask: np.ndarray,
-        darkness_score: np.ndarray,
+        support_score: np.ndarray,
         target_aspect: float,
         image_width: int,
         image_height: int,
@@ -611,13 +629,13 @@ class ImageCore:
     ) -> tuple[Optional[CropState], Optional[ProjectionDetectionResult]]:
         row_fraction = non_base_mask.mean(axis=1).astype(np.float32) / 255.0
         col_fraction = non_base_mask.mean(axis=0).astype(np.float32) / 255.0
-        row_darkness = darkness_score.mean(axis=1).astype(np.float32)
-        col_darkness = darkness_score.mean(axis=0).astype(np.float32)
+        row_support = support_score.mean(axis=1).astype(np.float32)
+        col_support = support_score.mean(axis=0).astype(np.float32)
 
         row_fraction = self._smooth_projection(row_fraction)
         col_fraction = self._smooth_projection(col_fraction)
-        row_darkness = self._smooth_projection(row_darkness)
-        col_darkness = self._smooth_projection(col_darkness)
+        row_support = self._smooth_projection(row_support)
+        col_support = self._smooth_projection(col_support)
 
         left = right = top = bottom = None
         left_conf = right_conf = top_conf = bottom_conf = 0.0
@@ -630,13 +648,13 @@ class ImageCore:
                 col_fraction,
                 threshold=0.58,
                 expected_center=expected_center_x,
-                support_values=col_darkness,
+                support_values=col_support,
             )
             top_bottom = self._find_projection_span(
                 row_fraction,
                 threshold=0.58,
                 expected_center=expected_center_y,
-                support_values=row_darkness,
+                support_values=row_support,
             )
 
             if left_right is not None:
@@ -645,13 +663,13 @@ class ImageCore:
                     col_fraction,
                     left,
                     side="start",
-                    support_values=col_darkness,
+                    support_values=col_support,
                 )
                 right_conf = self._compute_edge_confidence(
                     col_fraction,
                     right,
                     side="end",
-                    support_values=col_darkness,
+                    support_values=col_support,
                 )
             if top_bottom is not None:
                 top, bottom = top_bottom
@@ -659,13 +677,13 @@ class ImageCore:
                     row_fraction,
                     top,
                     side="start",
-                    support_values=row_darkness,
+                    support_values=row_support,
                 )
                 bottom_conf = self._compute_edge_confidence(
                     row_fraction,
                     bottom,
                     side="end",
-                    support_values=row_darkness,
+                    support_values=row_support,
                 )
         else:
             expected_left = int(round(previous_state.cx - previous_state.width / 2.0))
@@ -680,7 +698,7 @@ class ImageCore:
                 threshold=0.58,
                 expected_index=expected_left,
                 side="start",
-                support_values=col_darkness,
+                support_values=col_support,
                 max_offset=max_x_shift,
             )
             right, right_conf = self._find_edge_candidate(
@@ -688,7 +706,7 @@ class ImageCore:
                 threshold=0.58,
                 expected_index=expected_right,
                 side="end",
-                support_values=col_darkness,
+                support_values=col_support,
                 max_offset=max_x_shift,
             )
             top, top_conf = self._find_edge_candidate(
@@ -696,7 +714,7 @@ class ImageCore:
                 threshold=0.58,
                 expected_index=expected_top,
                 side="start",
-                support_values=row_darkness,
+                support_values=row_support,
                 max_offset=max_y_shift,
             )
             bottom, bottom_conf = self._find_edge_candidate(
@@ -704,7 +722,7 @@ class ImageCore:
                 threshold=0.58,
                 expected_index=expected_bottom,
                 side="end",
-                support_values=row_darkness,
+                support_values=row_support,
                 max_offset=max_y_shift,
             )
 
@@ -1052,7 +1070,12 @@ class ImageCore:
             scale = 1.0
         return np.clip(values.astype(np.float32) / float(scale), 0.0, 1.0)
 
-    def _suggest_film_base_sample_rect(self, gray: np.ndarray, min_area_ratio: float) -> tuple[int, int, int, int]:
+    def _suggest_film_base_sample_rect(
+        self,
+        gray: np.ndarray,
+        min_area_ratio: float,
+        film_type: FilmType = FilmType.NEGATIVE,
+    ) -> tuple[int, int, int, int]:
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         kernel = np.ones((5, 5), np.uint8)
@@ -1088,7 +1111,9 @@ class ImageCore:
             patch = gray[ry : ry + rh, rx : rx + rw]
             if patch.size == 0:
                 continue
-            score = (float(np.mean(patch)), -float(np.std(patch)))
+            mean_value = float(np.mean(patch))
+            brightness_score = mean_value if film_type == FilmType.NEGATIVE else -mean_value
+            score = (brightness_score, -float(np.std(patch)))
             if best_score is None or score > best_score:
                 best_score = score
                 best_rect = (rx, ry, rw, rh)

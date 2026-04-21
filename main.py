@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
 )
 
-from image_core import CropState, FilmBaseColorModel, ImageCore, ProxyImageBundle
+from image_core import CropState, FilmBaseColorModel, FilmType, ImageCore, ProxyImageBundle
 from ui import FilmGraphicsView
 
 
@@ -40,6 +40,10 @@ class MainWindow(QMainWindow):
         "1:1": 1.0,
         "6:7": 6 / 7,
         "自定义比例": "custom",
+    }
+    FILM_TYPE_MAP = {
+        "负片": FilmType.NEGATIVE,
+        "反转片": FilmType.REVERSAL,
     }
 
     def __init__(self) -> None:
@@ -88,6 +92,11 @@ class MainWindow(QMainWindow):
         self.ratio_box.addItems(list(self.ASPECT_MAP.keys()))
         self.ratio_box.setCurrentText("3:2")
         form.addRow("目标比例", self.ratio_box)
+
+        self.film_type_box = QComboBox()
+        self.film_type_box.addItems(list(self.FILM_TYPE_MAP.keys()))
+        self.film_type_box.setCurrentText("负片")
+        form.addRow("片型", self.film_type_box)
 
         self.custom_ratio_widget = QWidget()
         custom_ratio_layout = QHBoxLayout(self.custom_ratio_widget)
@@ -172,6 +181,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
 
         self.ratio_box.currentTextChanged.connect(self._on_ratio_changed)
+        self.film_type_box.currentTextChanged.connect(self._on_film_type_changed)
         self.custom_ratio_w.valueChanged.connect(self._on_custom_ratio_changed)
         self.custom_ratio_h.valueChanged.connect(self._on_custom_ratio_changed)
         self.angle_box.valueChanged.connect(self._on_angle_box_changed)
@@ -385,6 +395,9 @@ class MainWindow(QMainWindow):
             return self.custom_ratio_w.value() / self.custom_ratio_h.value()
         return float(selected)
 
+    def current_film_type(self) -> FilmType:
+        return self.FILM_TYPE_MAP[self.film_type_box.currentText()]
+
     def _resolve_crop_state(self, index: int, bundle: ProxyImageBundle) -> Optional[CropState]:
         path = self.file_paths[index]
         if path in self.approved_states:
@@ -398,6 +411,7 @@ class MainWindow(QMainWindow):
             proxy_8bit=bundle.proxy_8bit,
             target_aspect=self.current_target_aspect_ratio(),
             base_color_model=self.film_base_color_model,
+            film_type=self.current_film_type(),
             previous_state=previous_state,
         )
         if detected is not None:
@@ -466,7 +480,7 @@ class MainWindow(QMainWindow):
             return
 
         rgb = tuple(int(round(v)) for v in self.film_base_color_model.rgb_mean)
-        self.sample_base_label.setText(f"片基颜色: RGB{rgb}")
+        self.sample_base_label.setText(f"片基颜色: RGB{rgb}  ({self.film_type_box.currentText()})")
 
     def _proxy_to_qimage(self, proxy: np.ndarray) -> QImage:
         if proxy.ndim == 2:
@@ -551,6 +565,13 @@ class MainWindow(QMainWindow):
             return
         self._on_ratio_changed(self.ratio_box.currentText())
 
+    def _on_film_type_changed(self, _text: str) -> None:
+        self._refresh_sample_label()
+        self._recompute_current_crop(
+            success_message=f"已切换为{self.film_type_box.currentText()}，并重新生成当前图的裁切框。",
+            fallback_message=f"已切换为{self.film_type_box.currentText()}，自动检测失败，已保留默认框供手动调整。",
+        )
+
     def _on_angle_box_changed(self, value: float) -> None:
         self.viewer.crop_item.set_angle(value)
 
@@ -597,14 +618,10 @@ class MainWindow(QMainWindow):
         self.sample_base_preview_path = self.file_paths[self.current_index]
         self._refresh_sample_label()
 
-        state = self._resolve_crop_state(self.current_index, self.current_bundle)
-        if state is not None:
-            self.viewer.set_crop_state(state)
-            self.statusBar().showMessage("已完成片基取样，并重新生成当前图的裁切框。", 4000)
-            return
-
-        self.viewer.set_crop_state(self._build_default_crop_state(self.current_bundle))
-        self.statusBar().showMessage("片基取样已保存，自动检测失败，已给出默认框供手动调整。", 5000)
+        self._recompute_current_crop(
+            success_message="已完成片基取样，并重新生成当前图的裁切框。",
+            fallback_message="片基取样已保存，自动检测失败，已给出默认框供手动调整。",
+        )
 
     def _nudge_current_crop(self, dx: float, dy: float) -> None:
         if self.current_bundle is None or not self.viewer.has_crop_state():
@@ -615,6 +632,19 @@ class MainWindow(QMainWindow):
         if self.current_bundle is None or not self.viewer.has_crop_state():
             return
         self.viewer.crop_item.set_angle(self.viewer.crop_item.rotation() + delta_deg)
+
+    def _recompute_current_crop(self, success_message: str, fallback_message: str) -> None:
+        if self.current_bundle is None or self.current_index < 0 or self.film_base_color_model is None:
+            return
+
+        state = self._resolve_crop_state(self.current_index, self.current_bundle)
+        if state is not None:
+            self.viewer.set_crop_state(state)
+            self.statusBar().showMessage(success_message, 4000)
+            return
+
+        self.viewer.set_crop_state(self._build_default_crop_state(self.current_bundle))
+        self.statusBar().showMessage(fallback_message, 5000)
 
 
 
