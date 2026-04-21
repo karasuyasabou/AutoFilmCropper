@@ -454,6 +454,13 @@ class ImageCore:
         if projection is not None:
             self._draw_projection_guides(overlay, projection, img_w, img_h)
         if chosen_state is not None:
+            chosen_state = self._refine_detected_angle(
+                non_base_mask=non_base_mask,
+                target_aspect=target_aspect,
+                detected_state=chosen_state,
+                previous_state=previous_state,
+                min_area_ratio=min_area_ratio,
+            )
             self._draw_crop_state(overlay, chosen_state, (0, 255, 0), 3)
 
         return FilmBaseDebugBundle(
@@ -833,6 +840,135 @@ class ImageCore:
         cx = float(np.clip(cx, width / 2.0, image_width - width / 2.0))
         cy = float(np.clip(cy, height / 2.0, image_height - height / 2.0))
         return CropState(cx=cx, cy=cy, width=width, height=height, angle_deg=0.0), projection
+
+    def _refine_detected_angle(
+        self,
+        non_base_mask: np.ndarray,
+        target_aspect: float,
+        detected_state: CropState,
+        previous_state: Optional[CropState],
+        min_area_ratio: float,
+        followup_min_confidence: float = 0.58,
+        initial_min_confidence: float = 0.72,
+        max_center_shift_ratio: float = 0.35,
+        max_angle_delta_deg: float = 8.0,
+        max_angle_adjustment_deg: float = 2.0,
+        max_initial_angle_deg: float = 12.0,
+    ) -> CropState:
+        base_angle = float(previous_state.angle_deg) if previous_state is not None else float(detected_state.angle_deg)
+        reference_state = CropState(
+            cx=float(detected_state.cx),
+            cy=float(detected_state.cy),
+            width=float(detected_state.width),
+            height=float(detected_state.height),
+            angle_deg=float(base_angle),
+        )
+
+        refined_angle = float(base_angle)
+        estimate = self._estimate_angle_from_mask_contour(
+            non_base_mask=non_base_mask,
+            target_aspect=target_aspect,
+            reference_state=reference_state,
+            min_area_ratio=min_area_ratio,
+            max_center_shift_ratio=max_center_shift_ratio,
+        )
+        if estimate is not None:
+            angle_estimate_deg, confidence = estimate
+            if previous_state is None:
+                if confidence >= initial_min_confidence and abs(angle_estimate_deg) <= max_initial_angle_deg:
+                    refined_angle = float(angle_estimate_deg)
+            else:
+                delta = float(angle_estimate_deg - base_angle)
+                if confidence >= followup_min_confidence and abs(delta) <= max_angle_delta_deg:
+                    delta = float(np.clip(delta, -max_angle_adjustment_deg, max_angle_adjustment_deg))
+                    refined_angle = float(base_angle + delta)
+
+        refined_angle = float(np.clip(refined_angle, -15.0, 15.0))
+        return CropState(
+            cx=float(detected_state.cx),
+            cy=float(detected_state.cy),
+            width=float(detected_state.width),
+            height=float(detected_state.height),
+            angle_deg=refined_angle,
+        )
+
+    def _estimate_angle_from_mask_contour(
+        self,
+        non_base_mask: np.ndarray,
+        target_aspect: float,
+        reference_state: CropState,
+        min_area_ratio: float,
+        max_center_shift_ratio: float,
+    ) -> Optional[tuple[float, float]]:
+        contours, _ = cv2.findContours(non_base_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        image_height, image_width = non_base_mask.shape[:2]
+        min_area = image_height * image_width * float(min_area_ratio)
+        expected_area = max(float(reference_state.width) * float(reference_state.height), 1.0)
+        max_center_shift = max(float(reference_state.width), float(reference_state.height)) * float(max_center_shift_ratio)
+        target_box_aspect = max(float(target_aspect), 1.0 / max(float(target_aspect), 1e-6))
+
+        best_angle: Optional[float] = None
+        best_confidence = 0.0
+        best_area = 0.0
+
+        for cnt in contours:
+            area = float(cv2.contourArea(cnt))
+            if area < min_area:
+                continue
+
+            rect = cv2.minAreaRect(cnt)
+            (_, _), (rect_w, rect_h), _ = rect
+            if rect_w <= 1.0 or rect_h <= 1.0:
+                continue
+
+            candidate_state = self._rect_to_crop_state(
+                rect=rect,
+                target_aspect=target_aspect,
+                image_width=image_width,
+                image_height=image_height,
+            )
+            center_shift = math.hypot(candidate_state.cx - reference_state.cx, candidate_state.cy - reference_state.cy)
+            if max_center_shift > 0.0 and center_shift > max_center_shift:
+                continue
+
+            rect_area = float(rect_w * rect_h)
+            if rect_area <= 1.0:
+                continue
+
+            angle_deg = self._normalize_angle_near(candidate_state.angle_deg, reference_state.angle_deg)
+            fill_ratio = float(np.clip(area / rect_area, 0.0, 1.0))
+            rect_area_match = float(min(rect_area, expected_area) / max(rect_area, expected_area))
+            contour_area_match = float(min(area, expected_area) / max(area, expected_area))
+            candidate_box_aspect = max(float(rect_w), float(rect_h)) / max(1.0, min(float(rect_w), float(rect_h)))
+            aspect_match = float(min(candidate_box_aspect, target_box_aspect) / max(candidate_box_aspect, target_box_aspect))
+            if max_center_shift > 0.0:
+                position_score = 1.0 - min(center_shift / max_center_shift, 1.0)
+            else:
+                position_score = 1.0
+
+            confidence = float(
+                np.clip(
+                    0.30 * fill_ratio
+                    + 0.25 * rect_area_match
+                    + 0.20 * contour_area_match
+                    + 0.15 * aspect_match
+                    + 0.10 * position_score,
+                    0.0,
+                    1.0,
+                )
+            )
+
+            if confidence > best_confidence + 1e-6 or (abs(confidence - best_confidence) <= 1e-6 and area > best_area):
+                best_angle = float(angle_deg)
+                best_confidence = float(confidence)
+                best_area = float(area)
+
+        if best_angle is None:
+            return None
+        return best_angle, best_confidence
 
     @staticmethod
     def _smooth_projection(values: np.ndarray, kernel_size: int = 31) -> np.ndarray:
