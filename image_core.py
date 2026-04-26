@@ -851,8 +851,8 @@ class ImageCore:
         followup_min_confidence: float = 0.58,
         initial_min_confidence: float = 0.72,
         max_center_shift_ratio: float = 0.35,
-        max_angle_delta_deg: float = 8.0,
-        max_angle_adjustment_deg: float = 2.0,
+        max_angle_delta_deg: float = 1.5,
+        max_angle_adjustment_deg: float = 0.3,
         max_initial_angle_deg: float = 12.0,
     ) -> CropState:
         base_angle = float(previous_state.angle_deg) if previous_state is not None else float(detected_state.angle_deg)
@@ -865,13 +865,18 @@ class ImageCore:
         )
 
         refined_angle = float(base_angle)
-        estimate = self._estimate_angle_from_mask_contour(
+        estimate = self._estimate_angle_from_mask_lines(
             non_base_mask=non_base_mask,
-            target_aspect=target_aspect,
             reference_state=reference_state,
-            min_area_ratio=min_area_ratio,
-            max_center_shift_ratio=max_center_shift_ratio,
         )
+        if estimate is None:
+            estimate = self._estimate_angle_from_mask_contour(
+                non_base_mask=non_base_mask,
+                target_aspect=target_aspect,
+                reference_state=reference_state,
+                min_area_ratio=min_area_ratio,
+                max_center_shift_ratio=max_center_shift_ratio,
+            )
         if estimate is not None:
             angle_estimate_deg, confidence = estimate
             if previous_state is None:
@@ -891,6 +896,71 @@ class ImageCore:
             height=float(detected_state.height),
             angle_deg=refined_angle,
         )
+
+    def _estimate_angle_from_mask_lines(
+        self,
+        non_base_mask: np.ndarray,
+        reference_state: CropState,
+        max_abs_angle_deg: float = 5.0,
+        min_lines: int = 2,
+    ) -> Optional[tuple[float, float]]:
+        edges = cv2.Canny(non_base_mask, 50, 150, apertureSize=3)
+        image_height, image_width = non_base_mask.shape[:2]
+        min_line_length = max(80, int(round(min(image_width, image_height) * 0.12)))
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 1800.0,
+            threshold=80,
+            minLineLength=min_line_length,
+            maxLineGap=40,
+        )
+        if lines is None:
+            return None
+
+        angles: list[float] = []
+        weights: list[float] = []
+        for x1, y1, x2, y2 in lines[:, 0]:
+            dx = float(x2 - x1)
+            dy = float(y2 - y1)
+            length = math.hypot(dx, dy)
+            if length < min_line_length:
+                continue
+
+            angle = math.degrees(math.atan2(dy, dx))
+            if abs(angle) <= 20.0 or abs(abs(angle) - 180.0) <= 20.0:
+                skew = ((angle + 90.0) % 180.0) - 90.0
+            elif abs(abs(angle) - 90.0) <= 20.0:
+                skew = angle - 90.0 if angle > 0.0 else angle + 90.0
+            else:
+                continue
+
+            if abs(skew) > max_abs_angle_deg:
+                continue
+            angles.append(float(skew))
+            weights.append(float(length))
+
+        if len(angles) < min_lines:
+            return None
+
+        angle_array = np.asarray(angles, dtype=np.float32)
+        weight_array = np.asarray(weights, dtype=np.float32)
+        median_angle = float(np.median(angle_array))
+        abs_deviation = np.abs(angle_array - median_angle)
+        inliers = abs_deviation <= 1.0
+        if int(np.count_nonzero(inliers)) < min_lines:
+            return None
+
+        inlier_angles = angle_array[inliers]
+        inlier_weights = weight_array[inliers]
+        angle_deg = float(np.average(inlier_angles, weights=inlier_weights))
+        total_length = float(np.sum(inlier_weights))
+        expected_perimeter = max(1.0, 2.0 * (float(reference_state.width) + float(reference_state.height)))
+        consistency = 1.0 - min(float(np.std(inlier_angles)) / 1.0, 1.0)
+        count_score = min(1.0, float(len(inlier_angles)) / 6.0)
+        length_score = min(1.0, total_length / expected_perimeter)
+        confidence = float(np.clip(0.45 * consistency + 0.30 * count_score + 0.25 * length_score, 0.0, 1.0))
+        return angle_deg, confidence
 
     def _estimate_angle_from_mask_contour(
         self,

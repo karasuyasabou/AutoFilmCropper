@@ -7,5 +7,8 @@ build/
 dist/
 release-assets/
 
+TestImage/
+Testimage/
+
 .DS_Store
 Thumbs.db
