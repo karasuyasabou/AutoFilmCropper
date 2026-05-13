@@ -36,16 +36,6 @@ python main.py
 4. 确认需要导出的照片。
 5. 执行导出，生成裁切后的 TIFF 文件。
 
-## 构建发布包
-
-项目包含 GitHub Actions 发布流程：推送 `v*` 标签或手动触发 workflow 后，会构建 macOS 与 Windows 发布包。
-
-也可以在本地使用 PyInstaller 相关脚本进行构建：
-
-```bash
-python scripts/build_release.py --platform macos-arm64
-```
-
 ## 项目结构
 
 ```text
@@ -58,13 +48,4 @@ AutoFilmCropper/
 ├── main.py                 # 应用入口与主窗口控制逻辑
 ├── ui.py                   # 图形视图与交互组件
 └── requirements.txt        # Python 依赖
-```
-
-## 版本发布
-
-创建并推送版本标签即可触发自动构建与 GitHub Release：
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
 ```
