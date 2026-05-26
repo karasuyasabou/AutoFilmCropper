@@ -525,6 +525,7 @@ class ImageCore:
         scale_factor: float,
         output_path: str | Path,
         inset_ratio_per_side: float = 0.0,
+        source_tiff_path: str | Path | None = None,
     ) -> None:
         """Warp a rotated crop from proxy coordinates back to the 16-bit original."""
         if original_img_16bit.dtype != np.uint16:
@@ -572,7 +573,105 @@ class ImageCore:
 
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        tifffile.imwrite(str(output), cropped)
+        tifffile.imwrite(str(output), cropped, **self._tiff_save_kwargs_like(source_tiff_path))
+
+    def create_contact_sheet(self, image_paths: list[str | Path], output_path: str | Path) -> None:
+        """Create a TIFF contact sheet from exported TIFFs using the LightSourceDecouple layout."""
+        if not image_paths:
+            return
+
+        imgs = []
+        min_w = None
+        min_h = None
+
+        for path_like in image_paths:
+            path = Path(path_like)
+            if not path.exists():
+                continue
+
+            img = tifffile.imread(str(path))
+            if img.dtype != np.uint16:
+                raise ValueError(f"Expected uint16 TIFF, got {img.dtype} for {path}")
+            if img.ndim not in {2, 3}:
+                raise ValueError(f"Unsupported TIFF shape for contact sheet: {img.shape} ({path})")
+
+            img_small = img[::5, ::5, ...]
+            imgs.append(img_small)
+            h, w = img_small.shape[:2]
+            min_w = w if min_w is None else min(min_w, w)
+            min_h = h if min_h is None else min(min_h, h)
+
+        if not imgs or min_w is None or min_h is None:
+            return
+
+        cropped_imgs = [self._center_crop_image(img, min_h, min_w) for img in imgs]
+        cols = 6
+        rows = int(np.ceil(len(cropped_imgs) / cols))
+        first = cropped_imgs[0]
+        canvas_shape = (rows * min_h, cols * min_w) + first.shape[2:]
+        contact_sheet = np.zeros(canvas_shape, dtype=np.uint16)
+
+        for idx, img in enumerate(cropped_imgs):
+            row = idx // cols
+            col = idx % cols
+            x = col * min_w
+            y = row * min_h
+            contact_sheet[y : y + min_h, x : x + min_w, ...] = img
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(str(output), contact_sheet, **self._tiff_save_kwargs_like(image_paths[0], compression="zlib"))
+
+    def _tiff_save_kwargs_like(
+        self,
+        source_tiff_path: str | Path | None,
+        compression: str | None = None,
+    ) -> dict:
+        save_kwargs = {}
+        if compression is not None:
+            save_kwargs["compression"] = compression
+
+        icc_bytes = self._read_icc_profile_bytes(source_tiff_path)
+        if icc_bytes:
+            save_kwargs["extratags"] = [(34675, "B", len(icc_bytes), icc_bytes, False)]
+        return save_kwargs
+
+    @staticmethod
+    def _read_icc_profile_bytes(source_tiff_path: str | Path | None) -> bytes | None:
+        if source_tiff_path is None:
+            return None
+
+        try:
+            with tifffile.TiffFile(str(source_tiff_path)) as tif:
+                if not tif.pages:
+                    return None
+                tag = tif.pages[0].tags.get(34675)
+                if tag is None:
+                    return None
+                value = tag.value
+        except Exception:
+            return None
+
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, bytearray):
+            return bytes(value)
+        if isinstance(value, np.ndarray):
+            return value.astype(np.uint8, copy=False).tobytes()
+        try:
+            return bytes(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _center_crop_image(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        if h < target_h or w < target_w:
+            raise ValueError("crop size cannot be larger than source image")
+
+        top = (h - target_h) // 2
+        left = (w - target_w) // 2
+        return img[top : top + target_h, left : left + target_w, ...]
 
     @staticmethod
     def _to_gray(img: np.ndarray) -> np.ndarray:

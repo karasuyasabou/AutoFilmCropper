@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QCheckBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -130,6 +131,10 @@ class MainWindow(QMainWindow):
         self.export_inset_box.setSuffix("%")
         self.export_inset_box.setValue(0.0)
         form.addRow("四周内缩", self.export_inset_box)
+
+        self.contact_sheet_checkbox = QCheckBox("生成 contact sheet")
+        self.contact_sheet_checkbox.setChecked(True)
+        form.addRow("", self.contact_sheet_checkbox)
 
         self.exposure_slider = QSlider(Qt.Horizontal)
         self.exposure_slider.setRange(-30, 30)
@@ -328,6 +333,10 @@ class MainWindow(QMainWindow):
         total = len(approved_paths)
         inset_ratio_per_side = self.export_inset_box.value() / 100.0
         existing_outputs = [path.name for path in approved_paths if (output_dir / path.name).exists()]
+        should_create_contact_sheet = self.contact_sheet_checkbox.isChecked()
+        contact_sheet_path = output_dir / "contactsheet.tiff"
+        if should_create_contact_sheet and contact_sheet_path.exists():
+            existing_outputs.append(contact_sheet_path.name)
 
         if existing_outputs:
             preview_names = "\n".join(existing_outputs[:8])
@@ -350,6 +359,7 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(0)
         progress.setValue(0)
 
+        exported_paths: list[Path] = []
         for idx, path in enumerate(approved_paths, start=1):
             try:
                 progress.setLabelText(f"正在导出 {idx}/{total}: {path.name}")
@@ -372,7 +382,9 @@ class MainWindow(QMainWindow):
                     scale_factor=scale_factor,
                     output_path=output_path,
                     inset_ratio_per_side=inset_ratio_per_side,
+                    source_tiff_path=path,
                 )
+                exported_paths.append(output_path)
                 print(f"[{idx}/{total}] Exported {output_path}")
                 self.statusBar().showMessage(f"导出中 {idx}/{total}: {path.name}")
                 progress.setValue(idx)
@@ -385,9 +397,20 @@ class MainWindow(QMainWindow):
         if progress.wasCanceled():
             return
 
+        if should_create_contact_sheet and len(exported_paths) > 1:
+            try:
+                progress.setLabelText("正在生成 contact sheet...")
+                QApplication.processEvents()
+                self.image_core.create_contact_sheet(exported_paths, contact_sheet_path)
+            except Exception as exc:  # pragma: no cover - GUI fallback path
+                progress.cancel()
+                QMessageBox.critical(self, "Contact sheet 生成失败", f"生成 contactsheet.tiff 时发生错误:\n\n{exc}")
+                return
+
         progress.setValue(total)
         inset_text = f"{self.export_inset_box.value():.1f}%"
-        self.statusBar().showMessage(f"导出完成: {total} 张，四周内缩 {inset_text}，输出目录 {output_dir}", 6000)
+        contact_text = "，已生成 contact sheet" if should_create_contact_sheet and len(exported_paths) > 1 else ""
+        self.statusBar().showMessage(f"导出完成: {total} 张，四周内缩 {inset_text}{contact_text}，输出目录 {output_dir}", 6000)
 
     def current_target_aspect_ratio(self) -> float:
         selected = self.ASPECT_MAP.get(self.ratio_box.currentText())
